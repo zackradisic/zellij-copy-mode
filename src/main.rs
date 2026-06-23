@@ -107,6 +107,17 @@ impl GridBuilder {
         if !self.cur.is_empty() {
             self.lines.push(std::mem::take(&mut self.cur));
         }
+        // Trim trailing blank lines. A pane dump includes the whole viewport, so
+        // everything below where output ends is blank — without trimming, those
+        // empty rows show as dead space at the bottom of copy mode.
+        while self.lines.len() > 1
+            && self
+                .lines
+                .last()
+                .is_some_and(|l| l.iter().all(|c| c.ch == ' '))
+        {
+            self.lines.pop();
+        }
         self.lines
     }
 
@@ -674,10 +685,10 @@ impl State {
             .unwrap_or_default();
         let chars: Vec<char> = line.chars().collect();
         let mut i = self.cur_col;
-        while i > 0 && chars.get(i - 1).map_or(false, |c| c.is_whitespace()) {
+        while i > 0 && chars.get(i - 1).is_some_and(|c| c.is_whitespace()) {
             i -= 1;
         }
-        while i > 0 && chars.get(i - 1).map_or(false, |c| !c.is_whitespace()) {
+        while i > 0 && chars.get(i - 1).is_some_and(|c| !c.is_whitespace()) {
             i -= 1;
         }
         self.cur_col = i;
@@ -835,6 +846,12 @@ impl ZellijPlugin for State {
             self.needs_initial_scroll = false;
         }
 
+        // Never scroll past the point where the last line sits at the bottom of
+        // the view. Without this, a stale scroll (e.g. computed on the monochrome
+        // grid before the colored re-ingest changed the line count) leaves dead
+        // space below the content.
+        self.scroll = self.scroll.min(self.grid.len().saturating_sub(content_rows));
+
         let end = (self.scroll + content_rows).min(self.grid.len());
         for row in self.scroll..end {
             let line = &self.grid[row];
@@ -855,7 +872,7 @@ impl ZellijPlugin for State {
             out.push_str("\x1b[0m");
             println!("{out}\r");
         }
-        // Pad out any unused content rows so the status bar sits at the bottom.
+        // Pad any unused content rows so the status bar stays pinned to the bottom.
         for _ in end..(self.scroll + content_rows) {
             println!("\r");
         }
