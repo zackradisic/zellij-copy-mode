@@ -285,21 +285,37 @@ impl State {
         format!("/host/{DUMP_NAME}")
     }
 
-    /// Dump the target's scrollback. We render it in our own floating pane —
-    /// we never touch the target pane itself, so no panes can be suppressed.
-    fn enter(&mut self) {
-        let Some(target) = self.target else {
+    /// Resize our own floating pane to cover the whole screen, borderless.
+    fn cover_fullscreen(&self) {
+        let Some(PaneId::Plugin(id)) = self.self_id else {
             return;
         };
-        let Some(me) = self.self_id else {
+        if let Some(coords) = FloatingPaneCoordinates::new(
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("100%".to_string()),
+            Some("100%".to_string()),
+            None,
+            Some(true), // borderless
+        ) {
+            change_floating_panes_coordinates(vec![(PaneId::Plugin(id), coords)]);
+        }
+    }
+
+    /// Read the target's scrollback into our grid. We stay a floating pane (sized
+    /// to cover the screen, set in load()) — we never replace/suppress the target,
+    /// so there's no float→tiled transition (that was the flash) and nothing to
+    /// restore on exit.
+    fn enter(&mut self) {
+        let Some(target) = self.target else {
             return;
         };
         self.entered = true;
         // Grab the keyboard for vi-style motions (so zellij keybinds don't eat them).
         intercept_key_presses();
-        // Read the pane's scrollback *before* we swap, while the target is still
-        // in place. We run the text through the same vte parser, so if it carries
-        // ANSI we keep color; if it's plain we render monochrome.
+        // Read the live pane's scrollback. We run the text through the same vte
+        // parser, so if it carries ANSI we keep color; if it's plain we render
+        // monochrome.
         match get_pane_scrollback(target, true) {
             Ok(c) => {
                 let mut text = c.lines_above_viewport.join("\n");
@@ -311,10 +327,6 @@ impl State {
             }
             Err(e) => self.status = format!("scrollback err: {e}"),
         }
-        // Take the target's slot in place. Zellij suppresses the original behind
-        // us and auto-restores it when we close_self() on exit (same mechanism
-        // edit-scrollback uses — see close_pane's suppressed-pane branch).
-        replace_pane_with_existing_pane(target, me, true);
     }
 
     /// Try to read the dump; if it isn't there yet, schedule another poll.
@@ -355,13 +367,8 @@ impl State {
     }
 
     fn exit(&mut self) {
-        if let Some(target) = self.target {
-            // We suppressed the target via replace_pane_with_existing_pane, which
-            // keys it by its *own* id — so close_self() will NOT auto-restore it
-            // (that only happens for the editor/pid path). Un-suppress it
-            // explicitly (and focus it back) before we close ourselves.
-            show_pane_with_id(target, false, true);
-        }
+        // Non-destructive: we never suppressed the target, so just drop the key
+        // grab and close our floating pane.
         clear_key_presses_intercepts();
         close_self();
     }
@@ -648,12 +655,19 @@ impl ZellijPlugin for State {
             EventType::ActionComplete,
             EventType::Timer,
         ]);
+
+        // LaunchOrFocusPlugin opens us at the default (small, centered) floating
+        // size. Resize ourselves to cover the screen — doing this early (before
+        // the first paint) is what avoids the size flash. We try here and again
+        // once permission is definitely granted.
+        self.cover_fullscreen();
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.permissions_granted = true;
+                self.cover_fullscreen();
                 self.maybe_enter();
                 true
             }
@@ -687,15 +701,6 @@ impl ZellijPlugin for State {
                                 self.target = Some(PaneId::Terminal(p.id));
                             }
                         }
-                        // Once our own pane is no longer floating, the swap into
-                        // the tiled slot has taken effect — safe to render now.
-                        if p.is_plugin
-                            && Some(PaneId::Plugin(p.id)) == self.self_id
-                            && !p.is_floating
-                            && self.entered
-                        {
-                            self.revealed = true;
-                        }
                         let kind = if p.is_plugin { "P" } else { "T" };
                         let mut flags = String::new();
                         if p.is_focused {
@@ -712,9 +717,7 @@ impl ZellijPlugin for State {
                 }
                 self.dbg_panes = summary;
                 self.maybe_enter();
-                // Re-render while we haven't revealed yet (to catch the moment we
-                // land in the slot) and while not loaded.
-                !self.revealed || !self.loaded
+                !self.loaded
             }
             Event::ActionComplete(..) => {
                 // Backup path; the timer poll is the primary mechanism.
@@ -750,10 +753,8 @@ impl ZellijPlugin for State {
         self.rows = rows;
         self.cols = cols;
 
-        // Render nothing until we've loaded the scrollback AND landed in the
-        // tiled slot. This hides the brief floating-launch window so copy mode
-        // only ever appears in-place.
-        if !self.loaded || !self.revealed {
+        // Render nothing until the scrollback is loaded.
+        if !self.loaded {
             return;
         }
 
