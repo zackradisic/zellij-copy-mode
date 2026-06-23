@@ -1,0 +1,11 @@
+[package]
+name = "zellij-copy-mode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zellij-tile = "0.44.3"
+# Alacritty's pure-Rust VT parser. Compiles to wasm32-wasip1 with no system
+# deps. We implement its `Perform` trait to turn the ANSI dump of the target
+# pane into a grid of styled cells.
+vte = "0.11"
