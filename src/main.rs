@@ -237,6 +237,10 @@ struct State {
 
     /// True once we've issued the scrollback dump.
     entered: bool,
+    /// True once our pane has actually landed in the tiled slot (no longer
+    /// floating). We render nothing until then, to avoid the floating-launch
+    /// flash where the small centered floating window briefly shows.
+    revealed: bool,
     /// True once the dump file has been parsed into `grid`.
     loaded: bool,
 
@@ -287,13 +291,15 @@ impl State {
         let Some(target) = self.target else {
             return;
         };
+        let Some(me) = self.self_id else {
+            return;
+        };
         self.entered = true;
         // Grab the keyboard for vi-style motions (so zellij keybinds don't eat them).
         intercept_key_presses();
-        // Read the pane's scrollback directly — no file round-trip. We run the
-        // text through the same vte parser, so if it carries ANSI we keep color;
-        // if it's plain we render monochrome. (DumpScreen --ansi gives richer
-        // color but needs a host file path we haven't pinned down yet.)
+        // Read the pane's scrollback *before* we swap, while the target is still
+        // in place. We run the text through the same vte parser, so if it carries
+        // ANSI we keep color; if it's plain we render monochrome.
         match get_pane_scrollback(target, true) {
             Ok(c) => {
                 let mut text = c.lines_above_viewport.join("\n");
@@ -305,6 +311,10 @@ impl State {
             }
             Err(e) => self.status = format!("scrollback err: {e}"),
         }
+        // Take the target's slot in place. Zellij suppresses the original behind
+        // us and auto-restores it when we close_self() on exit (same mechanism
+        // edit-scrollback uses — see close_pane's suppressed-pane branch).
+        replace_pane_with_existing_pane(target, me, true);
     }
 
     /// Try to read the dump; if it isn't there yet, schedule another poll.
@@ -345,9 +355,13 @@ impl State {
     }
 
     fn exit(&mut self) {
-        // Non-destructive: just close our floating pane. The target was never
-        // touched, so there is nothing to restore.
-        let _ = std::fs::remove_file(self.dump_sandbox_path());
+        if let Some(target) = self.target {
+            // We suppressed the target via replace_pane_with_existing_pane, which
+            // keys it by its *own* id — so close_self() will NOT auto-restore it
+            // (that only happens for the editor/pid path). Un-suppress it
+            // explicitly (and focus it back) before we close ourselves.
+            show_pane_with_id(target, false, true);
+        }
         clear_key_presses_intercepts();
         close_self();
     }
@@ -648,16 +662,39 @@ impl ZellijPlugin for State {
                 true
             }
             Event::PaneUpdate(manifest) => {
-                // Find the focused *tiled* terminal — the pane sitting under our
-                // floating overlay. That's what we copy from. We never modify it.
+                // Which tab are we in? (the tab that contains our own plugin pane)
+                let my_tab = manifest.panes.iter().find_map(|(tab, panes)| {
+                    panes
+                        .iter()
+                        .any(|p| p.is_plugin && Some(PaneId::Plugin(p.id)) == self.self_id)
+                        .then_some(*tab)
+                });
+                // Target = the focused, tiled, terminal pane *in our tab*.
+                // Restricting to our tab disambiguates multi-tab / multi-client
+                // sessions where several panes report is_focused (one per tab).
                 let mut summary = String::new();
                 for (tab, panes) in &manifest.panes {
                     for p in panes {
-                        if p.is_focused && !p.is_plugin && !p.is_suppressed && !p.is_floating {
+                        let in_my_tab = Some(*tab) == my_tab;
+                        if in_my_tab
+                            && p.is_focused
+                            && !p.is_plugin
+                            && !p.is_suppressed
+                            && !p.is_floating
+                        {
                             self.last_focused_terminal = Some(PaneId::Terminal(p.id));
                             if self.target.is_none() {
                                 self.target = Some(PaneId::Terminal(p.id));
                             }
+                        }
+                        // Once our own pane is no longer floating, the swap into
+                        // the tiled slot has taken effect — safe to render now.
+                        if p.is_plugin
+                            && Some(PaneId::Plugin(p.id)) == self.self_id
+                            && !p.is_floating
+                            && self.entered
+                        {
+                            self.revealed = true;
                         }
                         let kind = if p.is_plugin { "P" } else { "T" };
                         let mut flags = String::new();
@@ -675,7 +712,9 @@ impl ZellijPlugin for State {
                 }
                 self.dbg_panes = summary;
                 self.maybe_enter();
-                !self.loaded
+                // Re-render while we haven't revealed yet (to catch the moment we
+                // land in the slot) and while not loaded.
+                !self.revealed || !self.loaded
             }
             Event::ActionComplete(..) => {
                 // Backup path; the timer poll is the primary mechanism.
@@ -711,17 +750,10 @@ impl ZellijPlugin for State {
         self.rows = rows;
         self.cols = cols;
 
-        if !self.loaded {
-            println!("\x1b[1mzellij-copy-mode (debug)\x1b[0m\r");
-            println!("perms={} entered={} loaded={} dump_attempts={}\r", self.permissions_granted, self.entered, self.loaded, self.dump_attempts);
-            println!("self_id={:?}\r", self.self_id);
-            println!("target={:?}\r", self.target);
-            println!("last_focused_terminal={:?}\r", self.last_focused_terminal);
-            println!("{}\r", self.dbg_focus);
-            println!("panes: {}\r", self.dbg_panes);
-            println!("dump_path={}\r", self.dump_sandbox_path());
-            println!("status: {}\r", self.status);
-            print!("\x1b[2m(press q to close)\x1b[0m");
+        // Render nothing until we've loaded the scrollback AND landed in the
+        // tiled slot. This hides the brief floating-launch window so copy mode
+        // only ever appears in-place.
+        if !self.loaded || !self.revealed {
             return;
         }
 
