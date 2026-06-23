@@ -1,21 +1,20 @@
 //! zellij-copy-mode — a tmux-style copy mode for Zellij, as a plugin.
 //!
-//! Architecture (see README / design notes):
-//!   1. On entry we identify the *target* terminal pane (the one the user was
-//!      focused on) and `replace_pane_with_existing_pane` ourselves into its
-//!      slot, suppressing the original. The plugin now sits in the exact same
-//!      spot/size — it looks like the pane "became" copy mode (à la tmux).
-//!   2. We dump the target's full scrollback *with ANSI* to a file via the
-//!      `DumpScreen` action, read it back, and parse it with `vte` into a grid
-//!      of styled `Cell`s. This is how we preserve the original colors that
-//!      `get_pane_scrollback` (plain text only) would throw away.
-//!   3. We render that grid ourselves with a block cursor + visual selection
-//!      overlaid, intercept all keys for vi-style motions, and `copy_to_clipboard`
-//!      on yank.
-//!
-//! Status: scaffold. The parse -> render -> navigate -> select -> yank core is
-//! implemented and compiles. The bits marked `TODO(live)` need a running Zellij
-//! to nail down (exact /host mount path, swap timing, target acquisition race).
+//! Architecture:
+//!   1. The keybind opens us as a floating pane. We find the *target* (the
+//!      focused, tiled terminal in our tab) from PaneUpdate, then resize our own
+//!      floating pane to exactly cover it (`change_floating_panes_coordinates`),
+//!      borderless. We never replace/suppress the target — it stays live behind
+//!      us — so there are no ghost panes and nothing to restore on exit.
+//!      Resizing early (before the first paint) keeps entry flash-free.
+//!   2. We read the target's scrollback two ways: `get_pane_scrollback` gives
+//!      plain text immediately (monochrome), then `DumpScreen --ansi` writes the
+//!      colored scrollback to a file (`/host` == plugin cwd) which we read back
+//!      and re-parse — upgrading the grid to full color. Both go through `vte`
+//!      into a grid of styled `Cell`s.
+//!   3. We render that grid with a block cursor + visual selection + status bar,
+//!      intercept keys for vi-style motions, and `copy_to_clipboard` on yank.
+//!      The cursor/scroll open at the live position so entry is seamless.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -237,8 +236,10 @@ struct State {
 
     /// True once we've issued the scrollback dump.
     entered: bool,
-    /// True once the dump file has been parsed into `grid`.
+    /// True once we have (monochrome) scrollback parsed into `grid`.
     loaded: bool,
+    /// True once we've upgraded the grid to the colored ANSI dump.
+    colored: bool,
 
     /// Target pane geometry (x, y, columns, rows) captured at acquisition, so we
     /// can size our floating overlay to exactly cover that pane.
@@ -282,8 +283,9 @@ const DUMP_NAME: &str = ".zellij-copy-mode-dump.ansi";
 
 impl State {
     fn dump_host_path(&self) -> String {
-        // DumpScreen writes a *host* path; we read it back through the `/host`
-        // mount. We assume `/host` == initial_cwd. TODO(live): verify mapping.
+        // DumpScreen writes a raw *host* path; we read it back through the `/host`
+        // mount. Verified in the server source: `/host` maps to the plugin's cwd
+        // (== initial_cwd), so these two resolve to the same file.
         format!("{}/{DUMP_NAME}", self.host_cwd.display())
     }
 
@@ -353,27 +355,52 @@ impl State {
             }
             Err(e) => self.status = format!("scrollback err: {e}"),
         }
+
+        // get_pane_scrollback is plain text (monochrome). Kick off a colored
+        // dump in parallel: DumpScreen --ansi writes the full scrollback with
+        // SGR escapes to a file we read back and re-parse. The target is live
+        // (we never suppress it), so this works.
+        let mut ctx = BTreeMap::new();
+        ctx.insert("copy_dump".to_string(), "1".to_string());
+        run_action(
+            actions::Action::DumpScreen {
+                file_path: Some(self.dump_host_path()),
+                include_scrollback: true,
+                pane_id: Some(target),
+                ansi: true,
+            },
+            ctx,
+        );
+        self.dump_attempts = 0;
+        set_timeout(0.05);
     }
 
-    /// Try to read the dump; if it isn't there yet, schedule another poll.
+    /// Poll for the colored ANSI dump; when it arrives, upgrade the grid to it,
+    /// preserving the current cursor/scroll.
     fn poll_dump(&mut self) {
-        if self.loaded {
+        if self.colored {
             return;
         }
         self.dump_attempts += 1;
         match std::fs::read(self.dump_sandbox_path()) {
-            Ok(bytes) if !bytes.is_empty() => self.ingest_dump(bytes),
-            Ok(_) => {
-                self.status = format!("dump empty (attempt {})", self.dump_attempts);
-                if self.dump_attempts < 60 {
+            Ok(bytes) if !bytes.is_empty() => {
+                let grid = parse_dump(&bytes);
+                if !grid.is_empty() {
+                    self.grid = grid;
+                    self.colored = true;
+                    self.clamp_cursor();
+                    let _ = std::fs::remove_file(self.dump_sandbox_path());
+                    return;
+                }
+                if self.dump_attempts < 40 {
                     set_timeout(0.05);
                 }
             }
-            Err(e) => {
-                self.status = format!("read err (attempt {}): {e}", self.dump_attempts);
-                if self.dump_attempts < 60 {
+            _ => {
+                if self.dump_attempts < 40 {
                     set_timeout(0.05);
                 }
+                // else: give up silently and keep the monochrome grid.
             }
         }
     }
@@ -673,6 +700,8 @@ impl ZellijPlugin for State {
             PermissionType::ChangeApplicationState,
             PermissionType::ReadPaneContents,
             PermissionType::WriteToClipboard,
+            // Needed for run_action(DumpScreen) — the colored ANSI dump.
+            PermissionType::RunActionsAsUser,
         ]);
         subscribe(&[
             EventType::PermissionRequestResult,
@@ -755,14 +784,14 @@ impl ZellijPlugin for State {
             }
             Event::ActionComplete(..) => {
                 // Backup path; the timer poll is the primary mechanism.
-                if self.entered && !self.loaded {
+                if self.entered && !self.colored {
                     self.poll_dump();
                     return true;
                 }
                 false
             }
             Event::Timer(_) => {
-                if self.entered && !self.loaded {
+                if self.entered && !self.colored {
                     self.poll_dump();
                     return true;
                 }
