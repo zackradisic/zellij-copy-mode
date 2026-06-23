@@ -237,12 +237,19 @@ struct State {
 
     /// True once we've issued the scrollback dump.
     entered: bool,
-    /// True once our pane has actually landed in the tiled slot (no longer
-    /// floating). We render nothing until then, to avoid the floating-launch
-    /// flash where the small centered floating window briefly shows.
-    revealed: bool,
     /// True once the dump file has been parsed into `grid`.
     loaded: bool,
+
+    /// Target pane geometry (x, y, columns, rows) captured at acquisition, so we
+    /// can size our floating overlay to exactly cover that pane.
+    target_geom: Option<(usize, usize, usize, usize)>,
+    /// Live cursor position (x, y) of the target pane at entry, if known.
+    target_cursor: Option<(usize, usize)>,
+    /// Grid row where the target's on-screen viewport begins (i.e. number of
+    /// scrollback lines above it). Used to map the live cursor into the grid.
+    viewport_start: usize,
+    /// Set on load so the first render scrolls to show the bottom (the live view).
+    needs_initial_scroll: bool,
 
     grid: Vec<Line>,
     /// First visible grid row.
@@ -267,8 +274,7 @@ struct State {
     /// How many times we've polled for the dump file.
     dump_attempts: u32,
 
-    // --- live diagnostics (shown on screen before load) ---
-    dbg_focus: String,
+    // --- live diagnostics ---
     dbg_panes: String,
 }
 
@@ -285,16 +291,21 @@ impl State {
         format!("/host/{DUMP_NAME}")
     }
 
-    /// Resize our own floating pane to cover the whole screen, borderless.
-    fn cover_fullscreen(&self) {
+    /// Resize our own floating pane to exactly cover the target pane (position +
+    /// size), borderless — so copy mode appears in place of that pane, working
+    /// correctly even with split layouts.
+    fn cover_target(&self) {
         let Some(PaneId::Plugin(id)) = self.self_id else {
             return;
         };
+        let Some((x, y, cols, rows)) = self.target_geom else {
+            return;
+        };
         if let Some(coords) = FloatingPaneCoordinates::new(
-            Some("0".to_string()),
-            Some("0".to_string()),
-            Some("100%".to_string()),
-            Some("100%".to_string()),
+            Some(x.to_string()),
+            Some(y.to_string()),
+            Some(cols.to_string()),
+            Some(rows.to_string()),
             None,
             Some(true), // borderless
         ) {
@@ -311,6 +322,9 @@ impl State {
             return;
         };
         self.entered = true;
+        // Size ourselves to exactly cover the target pane (done here, before the
+        // first content paint, which is what keeps it flash-free).
+        self.cover_target();
         // Grab the keyboard for vi-style motions (so zellij keybinds don't eat them).
         intercept_key_presses();
         // Read the live pane's scrollback. We run the text through the same vte
@@ -318,12 +332,24 @@ impl State {
         // monochrome.
         match get_pane_scrollback(target, true) {
             Ok(c) => {
+                // The viewport (what's currently on screen) starts after the
+                // scrollback lines above it.
+                self.viewport_start = c.lines_above_viewport.len();
                 let mut text = c.lines_above_viewport.join("\n");
                 if !c.lines_above_viewport.is_empty() {
                     text.push('\n');
                 }
                 text.push_str(&c.viewport.join("\n"));
                 self.ingest_dump(text.into_bytes());
+
+                // Place the cursor where the terminal cursor was: viewport row +
+                // the live cursor's (x, y) within the viewport.
+                if let Some((cx, cy)) = self.target_cursor {
+                    self.cur_row = self.viewport_start.saturating_add(cy);
+                    self.cur_col = cx;
+                }
+                self.clamp_cursor();
+                self.needs_initial_scroll = true;
             }
             Err(e) => self.status = format!("scrollback err: {e}"),
         }
@@ -656,18 +682,12 @@ impl ZellijPlugin for State {
             EventType::Timer,
         ]);
 
-        // LaunchOrFocusPlugin opens us at the default (small, centered) floating
-        // size. Resize ourselves to cover the screen — doing this early (before
-        // the first paint) is what avoids the size flash. We try here and again
-        // once permission is definitely granted.
-        self.cover_fullscreen();
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.permissions_granted = true;
-                self.cover_fullscreen();
                 self.maybe_enter();
                 true
             }
@@ -699,6 +719,20 @@ impl ZellijPlugin for State {
                             self.last_focused_terminal = Some(PaneId::Terminal(p.id));
                             if self.target.is_none() {
                                 self.target = Some(PaneId::Terminal(p.id));
+                                // Capture the live cursor so copy mode opens with
+                                // the cursor where the terminal cursor was.
+                                self.target_cursor = p.cursor_coordinates_in_pane;
+                                // Capture geometry so we cover exactly this pane.
+                                self.target_geom = Some((
+                                    p.pane_x,
+                                    p.pane_y,
+                                    p.pane_columns,
+                                    p.pane_rows,
+                                ));
+                                // Resize to the target ASAP — if this PaneUpdate
+                                // is processed before the first paint, it's
+                                // flash-free (same trick as the load() resize).
+                                self.cover_target();
                             }
                         }
                         let kind = if p.is_plugin { "P" } else { "T" };
@@ -761,6 +795,17 @@ impl ZellijPlugin for State {
         // Reserve the bottom row for the status bar so copy mode is visually
         // unmistakable (it otherwise looks identical to the live pane).
         let content_rows = rows.saturating_sub(1).max(1);
+
+        // On first paint, scroll so the bottom of the scrollback sits at the
+        // bottom of our view — i.e. show the same lines the live pane showed,
+        // then keep the cursor visible. (Done here because `rows` is only known
+        // at render time.)
+        if self.needs_initial_scroll {
+            self.scroll = self.grid.len().saturating_sub(content_rows);
+            self.scroll_to_cursor();
+            self.needs_initial_scroll = false;
+        }
+
         let end = (self.scroll + content_rows).min(self.grid.len());
         for row in self.scroll..end {
             let line = &self.grid[row];
