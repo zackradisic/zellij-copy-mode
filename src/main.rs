@@ -370,7 +370,8 @@ impl State {
     }
 
     fn scroll_to_cursor(&mut self) {
-        let rows = self.rows.max(1);
+        // Visible content height excludes the status bar row.
+        let rows = self.rows.saturating_sub(1).max(1);
         if self.cur_row < self.scroll {
             self.scroll = self.cur_row;
         } else if self.cur_row >= self.scroll + rows {
@@ -724,7 +725,10 @@ impl ZellijPlugin for State {
             return;
         }
 
-        let end = (self.scroll + rows).min(self.grid.len());
+        // Reserve the bottom row for the status bar so copy mode is visually
+        // unmistakable (it otherwise looks identical to the live pane).
+        let content_rows = rows.saturating_sub(1).max(1);
+        let end = (self.scroll + content_rows).min(self.grid.len());
         for row in self.scroll..end {
             let line = &self.grid[row];
             let mut out = String::new();
@@ -742,13 +746,43 @@ impl ZellijPlugin for State {
                 out.push(cell.ch);
             }
             out.push_str("\x1b[0m");
-            // Don't print a trailing newline on the final visible row.
-            if row + 1 < end {
-                println!("{out}");
-            } else {
-                print!("{out}");
-            }
+            println!("{out}\r");
         }
+        // Pad out any unused content rows so the status bar sits at the bottom.
+        for _ in end..(self.scroll + content_rows) {
+            println!("\r");
+        }
+        print!("{}", self.status_bar(cols));
+    }
+}
+
+impl State {
+    /// A distinctly-colored bottom bar: mode + position + key hints. This is the
+    /// "you are in copy mode" signal so the view isn't mistaken for a live pane.
+    fn status_bar(&self, cols: usize) -> String {
+        let (label, hints) = match self.mode {
+            Mode::Normal => ("COPY", "j/k move · v select · y yank · / search · q quit"),
+            Mode::Visual => ("VISUAL", "move to extend · y yank · Esc cancel"),
+            Mode::VisualLine => ("V-LINE", "move to extend · y yank · Esc cancel"),
+            Mode::Search => ("SEARCH", ""),
+        };
+        let pos = format!("{}/{}", self.cur_row + 1, self.grid.len());
+        let mut text = if self.mode == Mode::Search {
+            format!(" {label}  /{}", self.search_input)
+        } else {
+            format!(" {label}  {pos}  {hints}")
+        };
+        // Pad/truncate to full width.
+        let mut width = text.chars().count();
+        if width > cols {
+            text = text.chars().take(cols).collect();
+            width = cols;
+        }
+        for _ in width..cols {
+            text.push(' ');
+        }
+        // Bright bar: white text on blue background, bold.
+        format!("\x1b[1m\x1b[48;5;24m\x1b[38;5;231m{text}\x1b[0m")
     }
 }
 
