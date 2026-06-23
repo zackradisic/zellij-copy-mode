@@ -10,16 +10,30 @@ it with vim motions, visually select, and yank to the clipboard.
 
 ## How it works
 
-1. `Ctrl b` `[` runs `LaunchOrFocusPlugin … { floating true }`, opening the plugin
-   as a **floating pane on top** of the current pane. Nothing is suppressed or
-   replaced, so it can never strand "ghost" panes.
+1. `Ctrl b` `[` runs `LaunchOrFocusPlugin … { floating true; width "100%"; height
+   "100%"; … }`. It launches **floating at full size** (not the default small
+   centered size) so the subsequent swap into the slot has no visible "small →
+   full" jump.
 2. On a `PaneUpdate`, the plugin finds the focused, non-floating, non-plugin
-   terminal — the pane under the overlay — as its **target**.
-3. It reads that pane's scrollback via `get_pane_scrollback(target, full)` and
-   parses it (through `vte`) into a grid of styled cells.
-4. It renders the grid with a block cursor + visual selection, intercepts keys
-   for vi motions, and `copy_to_clipboard` on yank. Exit just closes the
-   floating pane.
+   terminal **in its own tab** as the **target** (the tab restriction
+   disambiguates multi-tab / multi-client sessions where several panes report
+   `is_focused`).
+3. It reads that pane's scrollback via `get_pane_scrollback(target, full)` *while
+   the pane is still live* and parses it (through `vte`) into a grid of styled
+   cells. (Reading must happen before the swap — `get_pane_scrollback` returns
+   "not found" for a suppressed pane.)
+4. It swaps into the target's slot in place via `replace_pane_with_existing_pane(
+   target, me, suppress=true)` — the original is suppressed behind us, so it
+   looks like the pane *became* copy mode.
+5. It renders the grid with a block cursor + visual selection + a status bar,
+   intercepts keys for vi motions, and `copy_to_clipboard` on yank.
+6. On exit, it **un-suppresses the target explicitly** (`show_pane_with_id`) then
+   `close_self`. NOTE: `replace_pane_with_existing_pane` keys the suppressed pane
+   by its *own* id, so `close_self` alone does **not** auto-restore it (only the
+   editor/`pid` path does) — the explicit un-suppress is required.
+
+We render nothing until both the scrollback is loaded *and* our pane has landed
+in the slot (no longer floating), to hide the brief floating-launch frame.
 
 ## Keys
 
@@ -51,12 +65,19 @@ tmux {
     bind "[" {
         LaunchOrFocusPlugin "file:/ABS/PATH/target/wasm32-wasip1/release/zellij-copy-mode.wasm" {
             floating true
+            x "0"
+            y "0"
+            width "100%"
+            height "100%"
             skip_cache true
         };
         SwitchToMode "Normal"
     }
 }
 ```
+
+(`skip_cache true` is for development — it forces a recompile so rebuilds show
+up; drop it once the plugin is stable.)
 
 ## Development
 
